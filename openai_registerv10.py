@@ -105,7 +105,7 @@ def get_gmail_otp(recipient_email: str, proxies: Any = None) -> str:
                             continue
 
                         # 搜索来自 openai.com 的未读邮件
-                        _, msg_ids = imap.search(None, 'FROM "openai.com"')
+                        _, msg_ids = imap.search(None, 'UNSEEN FROM "openai.com"')
                         for num in (msg_ids[0].split() or [])[-10:]:
                             if num in seen_ids:
                                 continue
@@ -1048,9 +1048,9 @@ def run(proxy: Optional[str]) -> Optional[str]:
 
                     # 提交登录验证码
                     current_resp = s.post(
-                        "https://auth.openai.com/api/accounts/email-otp/verify",
+                        "https://auth.openai.com/api/accounts/email-otp/validate",
                         headers={"accept": "application/json", "content-type": "application/json"},
-                        data=json.dumps({"code": login_otp})
+                        data=json.dumps({"code": login_otp, "trust_device": True})
                     )
                     print(f"[*] 登录码校验状态: {current_resp.status_code}")
                     human_delay(1.0, 2.0)
