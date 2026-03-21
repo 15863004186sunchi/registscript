@@ -931,7 +931,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
             human_delay(1.0, 2.0)
 
             # 2. 提交登录标识符
-            login_body = f'{{"username":{{"value":"{reg_email}","kind":"email"}},"screen_hint":"login"}}'
+            login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
             # 获取登录 Sentinel
             sen_resp = requests.post(
                 "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -985,7 +985,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     "content-type": "application/json",
                     "openai-sentinel-token": sentinel_pwd,
                 },
-                data=f'{{"password":"{reg_password}","username":"{reg_email}"}}'
+                data=f'{{"password":"{reg_password}","username":"{email}"}}'
             )
             print(f"[*] 提交密码状态: {pwd_resp.status_code}")
 
@@ -997,8 +997,8 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 otp_send_url = str(pwd_json.get("continue_url") or "https://auth.openai.com/api/accounts/email-otp/send")
                 s.get(otp_send_url, timeout=15)
                 
-                print(f"[*] 正在等待登录验证码 ({reg_email})....")
-                login_otp = get_gmail_otp(reg_email, proxies=proxies)
+                print(f"[*] 正在等待登录验证码 ({email})....")
+                login_otp = get_gmail_otp(email, proxies=proxies)
                 if not login_otp:
                     print("[Error] 未能在邮件中捕获到登录验证码")
                     return None
