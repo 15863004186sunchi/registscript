@@ -1003,7 +1003,8 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     )
                     sentinel_pwd = f'{{"p": "", "t": "", "c": "{sen_resp2.json().get("token","")}", "id": "{did}", "flow": "username_password_login"}}'
                     
-                    # 本次请求共享的 Header
+                    # 本次请求共享的 Payload 和 Header
+                    pwd_body = json.dumps({"password": reg_password, "username": email})
                     pwd_headers = {
                         "referer": cont_url or "https://auth.openai.com/login/password",
                         "accept": "application/json", "content-type": "application/json",
@@ -1020,17 +1021,22 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     
                     if pwd_resp.status_code == 404:
                          print("[Warn] /user/login 返回 404，尝试执行多路候选端点适配...")
-                         # 有时端点会根据环境变成 /user/register (即使是登录流) 或者 /login/password
                          for alt in ["/api/accounts/user/register", "/api/accounts/login", "/api/accounts/password"]:
                              alt_resp = s.post(f"https://auth.openai.com{alt}", headers=pwd_headers, data=pwd_body)
                              print(f"[DEBUG] 尝试候选 {alt} 状态: {alt_resp.status_code}")
                              if alt_resp.status_code in (200, 201):
                                  pwd_resp = alt_resp
                                  break
+
+                    if pwd_resp.status_code not in (200, 201):
+                        print("[Warn] 密码端点全线失败或拒绝，强制启用“邮箱验证码”无密登录流程...")
+                        # 覆写 page type 让后续逻辑走 OTP 验证的分支
+                        p_type = "email_otp_send"
+                        
                     current_resp = pwd_resp
 
                 # 情况 B: 触发邮件二次验证 (email_otp_send)
-                elif p_type == "email_otp_send":
+                if p_type == "email_otp_send":
                     print("[*] 触发登录二次验证 (Email OTP)，正在发送验证码...")
                     otp_send_url = str(curr_json.get("continue_url") or "https://auth.openai.com/api/accounts/email-otp/send")
                     s.get(otp_send_url, timeout=15)
