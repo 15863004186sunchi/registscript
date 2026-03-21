@@ -17,7 +17,12 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # 2. 安装 EPEL 及 SCL 仓库 (SCL 项目能为 CentOS 7 提供更高版本的 Python)
 info "正在配置仓库并安装基础编译工具..."
-yum install -y epel-release centos-release-scl
+yum install -y epel-release
+# 尝试安装两个可能的前缀
+yum install -y centos-release-scl centos-release-scl-rh || true
+# 清理缓存确保索引更新
+yum clean all
+yum makecache
 yum install -y wget curl git zip unzip gcc openssl-devel libffi-devel make
 
 # 3. 安装 Python 3.8 (通过 SCL)
