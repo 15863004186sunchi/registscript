@@ -66,7 +66,7 @@ def save_credentials(email: str, password: str, token_file: str = "") -> None:
 # ==========================================
 
 # ⚙️ 配置区（根据你的实际信息填写）
-CUSTOM_EMAIL_DOMAIN = "geeksun.us.ci"          # Cloudflare 托管的域名
+CUSTOM_EMAIL_DOMAIN = "geeksun.ccwu.cc"          # Cloudflare 托管的域名
 GMAIL_USER          = "geeksunchi@gmail.com"   # 接收转发的 Gmail 地址
 GMAIL_APP_PASSWORD  = "pnhddrssrehqqino"       # Gmail 应用专用密码（去掉空格）
 
