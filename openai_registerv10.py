@@ -921,6 +921,19 @@ def run(proxy: Optional[str]) -> Optional[str]:
         ca_page_type = str((ca_json.get("page") or {}).get("type") or "").strip()
 
         # 如果没有 workspace，或者明确要求 add_phone，则执行“登录绕过”策略
+        # ------------------------------------------------------------------
+        # 处理账号创建后的验证状态
+        # ------------------------------------------------------------------
+        auth_cookie = s.cookies.get("oai-client-auth-session")
+        auth_json = _decode_jwt_segment(auth_cookie.split(".")[0]) if auth_cookie else {}
+        workspaces = auth_json.get("workspaces") or []
+        
+        ca_json = {}
+        try: ca_json = create_account_resp.json()
+        except: pass
+        ca_page_type = str((ca_json.get("page") or {}).get("type") or "").strip()
+
+        # 如果没有 workspace，或者明确要求 add_phone，则执行“登录绕过”策略
         if not workspaces or ca_page_type == "add_phone":
             print("[*] 检测到手机验证拦截或权限缺失，尝试通过“二次登录”绕过...")
             
@@ -928,6 +941,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
             login_oauth = generate_oauth_url()
             s.get(login_oauth.auth_url, timeout=15)
             did = s.cookies.get("oai-did")
+            print(f"[DEBUG] Login Device ID: {did}")
             human_delay(1.0, 2.0)
 
             # 2. 提交登录标识符
@@ -945,7 +959,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 impersonate="chrome",
                 timeout=15,
             )
-            sen_token = sen_resp.json().get("token")
+            sen_token = sen_resp.json().get("token", "")
             sentinel_login = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
 
             auth_cont_resp = s.post(
@@ -960,12 +974,17 @@ def run(proxy: Optional[str]) -> Optional[str]:
             )
             print(f"[*] 提交登录意向状态: {auth_cont_resp.status_code}")
             
-            cont_url = str((auth_cont_resp.json() or {}).get("continue_url") or "").strip()
+            cont_url_data = auth_cont_resp.json() if auth_cont_resp.status_code == 200 else {}
+            cont_url = str(cont_url_data.get("continue_url") or "").strip()
+            print(f"[DEBUG] Login Continue URL: {cont_url}")
+            
             if cont_url:
                 s.get(cont_url, timeout=15)
                 human_delay(1.0, 2.0)
 
             # 3. 提交密码 (username_password_login)
+            # 根据经验，如果出现 404，可能是端点发生了变化。
+            # 我们先尝试通用的 /user/login，如果不行则尝试 /login/password 模式
             sen_resp2 = requests.post(
                 "https://sentinel.openai.com/backend-api/sentinel/req",
                 headers={"origin": "https://sentinel.openai.com", "content-type": "text/plain;charset=UTF-8"},
@@ -974,9 +993,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 impersonate="chrome",
                 timeout=15,
             )
-            sen_token2 = sen_resp2.json().get("token")
+            sen_token2 = sen_resp2.json().get("token", "")
             sentinel_pwd = f'{{"p": "", "t": "", "c": "{sen_token2}", "id": "{did}", "flow": "username_password_login"}}'
 
+            pwd_body = f'{{"password":"{reg_password}","username":"{email}"}}'
             pwd_resp = s.post(
                 "https://auth.openai.com/api/accounts/user/login",
                 headers={
@@ -985,41 +1005,64 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     "content-type": "application/json",
                     "openai-sentinel-token": sentinel_pwd,
                 },
-                data=f'{{"password":"{reg_password}","username":"{email}"}}'
+                data=pwd_body
             )
             print(f"[*] 提交密码状态: {pwd_resp.status_code}")
+            
+            # 后备诊断：如果主端点 404，探测候选端点
+            if pwd_resp.status_code == 404:
+                print("[Warn] /user/login 返回 404，尝试执行候选路径适配...")
+                # 有时端点会根据环境变成 /user/register (即使是登录流) 或者 /login/password
+                for alt_endpoint in ["/api/accounts/user/register", "/api/accounts/login"]:
+                    alt_resp = s.post(
+                        f"https://auth.openai.com{alt_endpoint}",
+                        headers={
+                            "referer": cont_url or "https://auth.openai.com/login/password",
+                            "accept": "application/json",
+                            "content-type": "application/json",
+                            "openai-sentinel-token": sentinel_pwd,
+                        },
+                        data=pwd_body
+                    )
+                    print(f"[DEBUG] 尝试候选端点 {alt_endpoint} 状态: {alt_resp.status_code}")
+                    if alt_resp.status_code in (200, 201):
+                        pwd_resp = alt_resp
+                        break
 
-            # 4. 重点：处理登录时的邮件验证码 (Login OTP)
-            pwd_json = pwd_resp.json() or {}
-            if pwd_json.get("page", {}).get("type") == "email_otp_send":
-                print("[*] 触发登录二次验证 (Email OTP)，正在发送验证码...")
-                # 触发发送按钮
-                otp_send_url = str(pwd_json.get("continue_url") or "https://auth.openai.com/api/accounts/email-otp/send")
-                s.get(otp_send_url, timeout=15)
+            # 4. 处理二次验证码 (Login OTP)
+            if pwd_resp.status_code in (200, 201):
+                pwd_json = {}
+                try: pwd_json = pwd_resp.json()
+                except: pass
                 
-                print(f"[*] 正在等待登录验证码 ({email})....")
-                login_otp = get_gmail_otp(email, proxies=proxies)
-                if not login_otp:
-                    print("[Error] 未能在邮件中捕获到登录验证码")
-                    return None
-                print(f"[*] 捕捉到登录验证码: {login_otp}")
+                if (pwd_json.get("page") or {}).get("type") == "email_otp_send":
+                    print("[*] 触发登录二次验证 (Email OTP)，正在发送验证码...")
+                    otp_send_url = str(pwd_json.get("continue_url") or "https://auth.openai.com/api/accounts/email-otp/send")
+                    s.get(otp_send_url, timeout=15)
+                    
+                    print(f"[*] 正在等待登录验证码 ({email})....")
+                    login_otp = get_gmail_otp(email, proxies=proxies)
+                    if not login_otp:
+                        print("[Error] 未能在邮件中捕获到登录验证码")
+                        return None
+                    print(f"[*] 捕捉到登录验证码: {login_otp}")
 
-                # 提交登录验证码
-                s.post(
-                    "https://auth.openai.com/api/accounts/email-otp/verify",
-                    headers={"accept": "application/json", "content-type": "application/json"},
-                    data=json.dumps({"code": login_otp})
-                )
-                print("[✔] 登录验证码校验完成")
-                human_delay(1.0, 2.0)
+                    # 提交登录验证码
+                    s.post(
+                        "https://auth.openai.com/api/accounts/email-otp/verify",
+                        headers={"accept": "application/json", "content-type": "application/json"},
+                        data=json.dumps({"code": login_otp})
+                    )
+                    print("[✔] 登录验证码校验完成")
+                    human_delay(1.0, 2.0)
 
             # 5. 最后同步 Cookie 并获取 workspace
             auth_cookie = s.cookies.get("oai-client-auth-session")
-            if not auth_cookie:
-                print("[Error] 登录流完成后仍未获取到 auth Cookie")
-                return None
-            auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
-            workspaces = auth_json.get("workspaces") or []
+            if auth_cookie:
+                auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
+                workspaces = auth_json.get("workspaces") or []
+            else:
+                print("[Error] 绕过流程完成后仍未获取到 auth Cookie，可能是密码验证未真正通过")
 
         if not workspaces:
             print("[Error] 最终授权 Cookie 中仍缺失 workspace，绕过失败")
