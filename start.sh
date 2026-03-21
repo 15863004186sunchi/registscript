@@ -5,8 +5,12 @@
 APP_NAME="openai_registerv10.py"
 # 日志文件名
 LOG_FILE="openai_registerv10.log"
-# Python解释器
-PYTHON_CMD="python3"
+# Python解释器 (针对 CentOS 7 SCL 环境做自动适配)
+if [ -f "/opt/rh/rh-python38/root/usr/bin/python3" ]; then
+    PYTHON_CMD="/opt/rh/rh-python38/root/usr/bin/python3"
+else
+    PYTHON_CMD="python3"
+fi
 # ==========================================
 
 # 获取进程PID
