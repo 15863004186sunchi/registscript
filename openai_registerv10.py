@@ -909,115 +909,132 @@ def run(proxy: Optional[str]) -> Optional[str]:
             return None
 
         # ------------------------------------------------------------------
-        # 处理 create_account 后的 continue_url（可能是 add-phone 等新步骤）
-        # ------------------------------------------------------------------
-        try:
-            ca_json = create_account_resp.json()
-        except Exception:
-            ca_json = {}
-        ca_continue_url = str(ca_json.get("continue_url") or "").strip()
-        ca_page_type = str((ca_json.get("page") or {}).get("type") or "").strip()
-
-        if ca_continue_url:
-            print(f"[*] create_account 返回中间步骤: {ca_page_type} -> {ca_continue_url}")
-            # 先跟随 continue_url，让 session 进入下一页面状态
-            s.get(ca_continue_url, timeout=15)
-            human_delay(1.0, 2.5)
-
-            if ca_page_type == "add_phone":
-                # 尝试跳过手机验证（某些账号类型或地区允许跳过）
-                print("[*] 检测到手机验证步骤，尝试跳过...")
-
-                # 策略1: 尝试 skip 端点
-                skip_resp = s.post(
-                    "https://auth.openai.com/api/accounts/phone/skip",
-                    headers={
-                        "referer": "https://auth.openai.com/add-phone",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
-                    data="{}",
-                )
-                print(f"[DEBUG] phone/skip 状态: {skip_resp.status_code}")
-                print(f"[DEBUG] phone/skip 响应: {skip_resp.text[:300]}")
-
-                if skip_resp.status_code == 200:
-                    print("[✔] 成功跳过手机验证!")
-                    # 检查 skip 是否返回了新的 continue_url
-                    try:
-                        skip_json = skip_resp.json()
-                        skip_continue = str(skip_json.get("continue_url") or "").strip()
-                        if skip_continue:
-                            print(f"[*] skip 返回 continue_url: {skip_continue}")
-                            s.get(skip_continue, timeout=15)
-                            human_delay(0.5, 1.5)
-                    except Exception:
-                        pass
-                else:
-                    # 策略2: 尝试 authorize/continue 直接推进
-                    print("[Warn] phone/skip 失败，尝试直接推进流程...")
-                    push_resp = s.post(
-                        "https://auth.openai.com/api/accounts/authorize/continue",
-                        headers={
-                            "referer": "https://auth.openai.com/add-phone",
-                            "accept": "application/json",
-                            "content-type": "application/json",
-                        },
-                        data="{}",
-                    )
-                    print(f"[DEBUG] authorize/continue(push) 状态: {push_resp.status_code}")
-                    print(f"[DEBUG] authorize/continue(push) 响应: {push_resp.text[:300]}")
-
-                    if push_resp.status_code == 200:
-                        try:
-                            push_json = push_resp.json()
-                            push_continue = str(push_json.get("continue_url") or "").strip()
-                            if push_continue:
-                                s.get(push_continue, timeout=15)
-                                human_delay(0.5, 1.5)
-                        except Exception:
-                            pass
-                    else:
-                        print("[Error] 手机验证无法跳过，OpenAI 强制要求绑定手机号")
-                        print("[Error] 需要接入短信验证码服务（如 sms-activate.org）才能继续")
-                        return None
-
-            else:
-                # 非手机验证的其他中间步骤，尝试直接跟随
-                print(f"[*] 跟随中间步骤: {ca_page_type}")
-
-        # ------------------------------------------------------------------
-        # 重新读取 Cookie（经过中间步骤后 Cookie 可能已更新）
+        # 处理账号创建后的验证状态
         # ------------------------------------------------------------------
         auth_cookie = s.cookies.get("oai-client-auth-session")
-        if not auth_cookie:
-            print("[Error] 未能获取到授权 Cookie")
-            return None
-
-        auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
-        print(f"[DEBUG] auth_json 完整内容: {json.dumps(auth_json, ensure_ascii=False)[:800]}")
+        auth_json = _decode_jwt_segment(auth_cookie.split(".")[0]) if auth_cookie else {}
         workspaces = auth_json.get("workspaces") or []
+        
+        ca_json = {}
+        try: ca_json = create_account_resp.json()
+        except: pass
+        ca_page_type = str((ca_json.get("page") or {}).get("type") or "").strip()
+
+        # 如果没有 workspace，或者明确要求 add_phone，则执行“登录绕过”策略
+        if not workspaces or ca_page_type == "add_phone":
+            print("[*] 检测到手机验证拦截或权限缺失，尝试通过“二次登录”绕过...")
+            
+            # 1. 重新发起 OAuth 授权 (获取登录意图的 state)
+            login_oauth = generate_oauth_url()
+            s.get(login_oauth.auth_url, timeout=15)
+            did = s.cookies.get("oai-did")
+            human_delay(1.0, 2.0)
+
+            # 2. 提交登录标识符
+            login_body = f'{{"username":{{"value":"{reg_email}","kind":"email"}},"screen_hint":"login"}}'
+            # 获取登录 Sentinel
+            sen_resp = requests.post(
+                "https://sentinel.openai.com/backend-api/sentinel/req",
+                headers={
+                    "origin": "https://sentinel.openai.com",
+                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                    "content-type": "text/plain;charset=UTF-8"
+                },
+                data=f'{{"p":"","id":"{did}","flow":"authorize_continue"}}',
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=15,
+            )
+            sen_token = sen_resp.json().get("token")
+            sentinel_login = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
+
+            auth_cont_resp = s.post(
+                "https://auth.openai.com/api/accounts/authorize/continue",
+                headers={
+                    "referer": login_oauth.auth_url,
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel_login,
+                },
+                data=login_body,
+            )
+            print(f"[*] 提交登录意向状态: {auth_cont_resp.status_code}")
+            
+            cont_url = str((auth_cont_resp.json() or {}).get("continue_url") or "").strip()
+            if cont_url:
+                s.get(cont_url, timeout=15)
+                human_delay(1.0, 2.0)
+
+            # 3. 提交密码 (username_password_login)
+            sen_resp2 = requests.post(
+                "https://sentinel.openai.com/backend-api/sentinel/req",
+                headers={"origin": "https://sentinel.openai.com", "content-type": "text/plain;charset=UTF-8"},
+                data=f'{{"p":"","id":"{did}","flow":"username_password_login"}}',
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=15,
+            )
+            sen_token2 = sen_resp2.json().get("token")
+            sentinel_pwd = f'{{"p": "", "t": "", "c": "{sen_token2}", "id": "{did}", "flow": "username_password_login"}}'
+
+            pwd_resp = s.post(
+                "https://auth.openai.com/api/accounts/user/login",
+                headers={
+                    "referer": cont_url or "https://auth.openai.com/login/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel_pwd,
+                },
+                data=f'{{"password":"{reg_password}","username":"{reg_email}"}}'
+            )
+            print(f"[*] 提交密码状态: {pwd_resp.status_code}")
+
+            # 4. 重点：处理登录时的邮件验证码 (Login OTP)
+            pwd_json = pwd_resp.json() or {}
+            if pwd_json.get("page", {}).get("type") == "email_otp_send":
+                print("[*] 触发登录二次验证 (Email OTP)，正在发送验证码...")
+                # 触发发送按钮
+                otp_send_url = str(pwd_json.get("continue_url") or "https://auth.openai.com/api/accounts/email-otp/send")
+                s.get(otp_send_url, timeout=15)
+                
+                print(f"[*] 正在等待登录验证码 ({reg_email})....")
+                login_otp = get_gmail_otp(reg_email, proxies=proxies)
+                if not login_otp:
+                    print("[Error] 未能在邮件中捕获到登录验证码")
+                    return None
+                print(f"[*] 捕捉到登录验证码: {login_otp}")
+
+                # 提交登录验证码
+                s.post(
+                    "https://auth.openai.com/api/accounts/email-otp/verify",
+                    headers={"accept": "application/json", "content-type": "application/json"},
+                    data=json.dumps({"code": login_otp})
+                )
+                print("[✔] 登录验证码校验完成")
+                human_delay(1.0, 2.0)
+
+            # 5. 最后同步 Cookie 并获取 workspace
+            auth_cookie = s.cookies.get("oai-client-auth-session")
+            if not auth_cookie:
+                print("[Error] 登录流完成后仍未获取到 auth Cookie")
+                return None
+            auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
+            workspaces = auth_json.get("workspaces") or []
+
         if not workspaces:
-            print("[Error] 授权 Cookie 里没有 workspace 信息（手机验证可能未通过）")
-            return None
-        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-        if not workspace_id:
-            print("[Error] 无法解析 workspace_id")
+            print("[Error] 最终授权 Cookie 中仍缺失 workspace，绕过失败")
             return None
 
-        select_body = f'{{"workspace_id":"{workspace_id}"}}'
+        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+        print(f"[*] 选择工作区 ID: {workspace_id}")
+        
         select_resp = s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
-            headers={
-                "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-                "content-type": "application/json",
-            },
-            data=select_body,
+            headers={"content-type": "application/json"},
+            data=f'{{"workspace_id":"{workspace_id}"}}'
         )
-
         if select_resp.status_code != 200:
-            print(f"[Error] 选择 workspace 失败，状态码: {select_resp.status_code}")
-            print(select_resp.text)
+            print(f"[Error] 工作区选择失败: {select_resp.status_code}")
             return None
 
         continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
