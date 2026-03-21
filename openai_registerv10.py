@@ -1003,21 +1003,30 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     )
                     sentinel_pwd = f'{{"p": "", "t": "", "c": "{sen_resp2.json().get("token","")}", "id": "{did}", "flow": "username_password_login"}}'
                     
-                    # 尝试提交密码到 login 端点
+                    # 本次请求共享的 Header
+                    pwd_headers = {
+                        "referer": cont_url or "https://auth.openai.com/login/password",
+                        "accept": "application/json", "content-type": "application/json",
+                        "openai-sentinel-token": sentinel_pwd,
+                    }
+
+                    # 尝试提交密码到 login 端点 (优先尝试标准路径)
                     pwd_resp = s.post(
                         "https://auth.openai.com/api/accounts/user/login",
-                        headers={
-                            "referer": cont_url or "https://auth.openai.com/login/password",
-                            "accept": "application/json", "content-type": "application/json",
-                            "openai-sentinel-token": sentinel_pwd,
-                        },
-                        data=json.dumps({"password": reg_password, "username": email})
+                        headers=pwd_headers,
+                        data=pwd_body
                     )
-                    print(f"[*] 密码提交状态: {pwd_resp.status_code}")
+                    print(f"[*] /user/login 提交状态: {pwd_resp.status_code}")
+                    
                     if pwd_resp.status_code == 404:
-                         # 兼容性备选：某些流程下可能使用 /register 端点即使是在登录意图下
-                         pwd_resp = s.post("https://auth.openai.com/api/accounts/user/register", 
-                                           headers=pwd_resp.request.headers, data=pwd_resp.request.body)
+                         print("[Warn] /user/login 返回 404，尝试执行多路候选端点适配...")
+                         # 有时端点会根据环境变成 /user/register (即使是登录流) 或者 /login/password
+                         for alt in ["/api/accounts/user/register", "/api/accounts/login", "/api/accounts/password"]:
+                             alt_resp = s.post(f"https://auth.openai.com{alt}", headers=pwd_headers, data=pwd_body)
+                             print(f"[DEBUG] 尝试候选 {alt} 状态: {alt_resp.status_code}")
+                             if alt_resp.status_code in (200, 201):
+                                 pwd_resp = alt_resp
+                                 break
                     current_resp = pwd_resp
 
                 # 情况 B: 触发邮件二次验证 (email_otp_send)
