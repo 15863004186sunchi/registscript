@@ -62,7 +62,7 @@ def login_openai(email: str, password: str, proxies: Any = None):
         print(f"[*] Device ID: {did}")
 
         # 1. 提交标识符 (login 意图)
-        login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
+        login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login_or_signup"}}'
         sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
         
         sen_resp = requests.post(
