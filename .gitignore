@@ -36,3 +36,6 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+
+# Skills / Agents (子仓库保留，但不纳入本仓库追踪)
+.agents/skills/
