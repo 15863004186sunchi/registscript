@@ -37,5 +37,6 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Skills / Agents (子仓库保留，但不纳入本仓库追踪)
-.agents/skills/
+# Skills / Agents
+.agents/skills/js-reverse-automation--skill/
+!.agents/skills/web-reverse-engineering/
