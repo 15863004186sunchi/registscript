@@ -77,7 +77,7 @@ def generate_custom_email() -> str:
     local = f"{prefix}{secrets.token_hex(4)}"
     return f"{local}@{CUSTOM_EMAIL_DOMAIN}"
 
-def get_gmail_otp(recipient_email: str, proxies: Any = None) -> str:
+def get_gmail_otp(recipient_email: str, proxies: Any = None, ignore_code: str = "") -> str:
     """
     通过 Gmail IMAP 轮询，找到转发自 OpenAI 的邮件并提取 6 位验证码。
     同时检查 INBOX 和 [Gmail]/Spam 文件夹，避免因垃圾邮件过滤而漏读。
@@ -141,10 +141,13 @@ def get_gmail_otp(recipient_email: str, proxies: Any = None) -> str:
 
                             m = re.search(regex, body)
                             if m:
+                                code = m.group(1)
+                                if ignore_code and code == ignore_code:
+                                    continue
                                 # 标记为已读
                                 imap.store(num, "+FLAGS", "\\Seen")
-                                print(" 抓到啦! 验证码:", m.group(1))
-                                return m.group(1)
+                                print(" 抓到啦! 验证码:", code)
+                                return code
                     except Exception:
                         continue
         except Exception as e:
@@ -175,7 +178,7 @@ def get_tempmail_lol_email(proxies: Any = None) -> tuple:
         print(f"[Error] Tempmail.lol 初始化失败: {e}")
     return "", "", ""
 
-def get_tempmail_lol_code(token: str, email: str, proxies: Any = None) -> str:
+def get_tempmail_lol_code(token: str, email: str, proxies: Any = None, ignore_code: str = "") -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: set = set()
     print(f"[*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
@@ -209,8 +212,11 @@ def get_tempmail_lol_code(token: str, email: str, proxies: Any = None) -> str:
                     if "openai" in sender or "openai" in content.lower():
                         m = re.search(regex, content)
                         if m:
-                            print(" 抓到啦! 验证码:", m.group(1))
-                            return m.group(1)
+                            code = m.group(1)
+                            if ignore_code and code == ignore_code:
+                                continue
+                            print(" 抓到啦! 验证码:", code)
+                            return code
         except Exception:
             pass
         time.sleep(3)
@@ -277,7 +283,7 @@ def get_guerrilla_email(proxies: Any = None) -> tuple:
         return "", "", ""
 
 
-def get_guerrilla_code(sid: str, email: str, proxies: Any = None) -> str:
+def get_guerrilla_code(sid: str, email: str, proxies: Any = None, ignore_code: str = "") -> str:
     """轮询 Guerrilla Mail 收件箱获取 OpenAI 验证码"""
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: set = set()
@@ -331,8 +337,11 @@ def get_guerrilla_code(sid: str, email: str, proxies: Any = None) -> str:
 
                 m = re.search(regex, combined)
                 if m:
-                    print(" 抓到啦! 验证码:", m.group(1))
-                    return m.group(1)
+                    code = m.group(1)
+                    if ignore_code and code == ignore_code:
+                        continue
+                    print(" 抓到啦! 验证码:", code)
+                    return code
         except Exception:
             pass
 
@@ -469,7 +478,7 @@ def get_email_and_token(proxies: Any = None) -> tuple:
     return "", "", ""
 
 
-def get_oai_code(token: str, email: str, proxies: Any = None, base: str = MAILTM_BASE) -> str:
+def get_oai_code(token: str, email: str, proxies: Any = None, base: str = MAILTM_BASE, ignore_code: str = "") -> str:
     """使用指定服务商的 Token 轮询获取 OpenAI 验证码"""
     url_list = f"{base}/messages"
     regex = r"(?<!\d)(\d{6})(?!\d)"
@@ -534,8 +543,11 @@ def get_oai_code(token: str, email: str, proxies: Any = None, base: str = MAILTM
 
                 m = re.search(regex, content)
                 if m:
-                    print(" 抓到啦! 验证码:", m.group(1))
-                    return m.group(1)
+                    code = m.group(1)
+                    if ignore_code and code == ignore_code:
+                        continue
+                    print(" 抓到啦! 验证码:", code)
+                    return code
         except Exception:
             pass
 
@@ -943,8 +955,11 @@ def run(proxy: Optional[str]) -> Optional[str]:
             code = get_guerrilla_code(dev_token, email, proxies)
         else:
             code = get_oai_code(dev_token, email, proxies, base=mail_base)
+            
         if not code:
             return None
+            
+        reg_otp = code
         human_delay(1.0, 3.0)  # 模拟用户手动输入验证码
 
         code_body = f'{{"code":"{code}"}}'
@@ -1060,13 +1075,13 @@ def run(proxy: Optional[str]) -> Optional[str]:
             human_delay(2.0, 5.0)
             
             if mail_base == "custom_gmail":
-                login_otp = get_gmail_otp(email, proxies)
+                login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
             elif mail_base == "tempmail_lol":
-                login_otp = get_tempmail_lol_code(dev_token, email, proxies)
+                login_otp = get_tempmail_lol_code(dev_token, email, proxies, ignore_code=reg_otp)
             elif mail_base == "guerrilla":
-                login_otp = get_guerrilla_code(dev_token, email, proxies)
+                login_otp = get_guerrilla_code(dev_token, email, proxies, ignore_code=reg_otp)
             else:
-                login_otp = get_oai_code(dev_token, email, proxies, base=mail_base)
+                login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
                 
             if not login_otp:
                 print("[Error] 登录验证码获取失败")
@@ -1080,7 +1095,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     "accept": "application/json", 
                     "content-type": "application/json"
                 },
-                data=json.dumps({"code": login_otp, "trust_device": True})
+                data=json.dumps({"code": login_otp})
             )
             print(f"[*] 登录密码OTP校验状态: {otp_val_resp.status_code}")
             if otp_val_resp.status_code != 200:
