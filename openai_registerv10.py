@@ -396,25 +396,8 @@ def _mailtm_domains(proxies: Any = None, base: str = MAILTM_BASE) -> List[str]:
     return domains
 
 
-def get_email_and_token(proxies: Any = None) -> tuple:
-    """创建临时邮箱并获取螺询凭证，自定义域名优先，Guerrilla Mail 备用"""
-    if CUSTOM_EMAIL_DOMAIN and GMAIL_USER and GMAIL_APP_PASSWORD:
-        email = generate_custom_email()
-        print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({CUSTOM_EMAIL_DOMAIN})")
-        return email, "gmail_imap_token", "custom_gmail"
-
-    # === 第一优先级：Tempmail.lol (免配置，无拦截) ===
-    email, token, provider = get_tempmail_lol_email(proxies)
-    if email and token:
-        return email, token, provider
-
-    # === 第二优先级：Guerrilla Mail（域名把控独立，被封概率低）===
-    email, token, provider = get_guerrilla_email(proxies)
-    if email and token:
-        return email, token, provider
-
-    # === 备用：Mail.tm / mail.gw ===
-    print("[Warn] Guerrilla Mail 失败，切换到 Mail.tm 备用..")
+def get_mailtm_email(proxies: Any = None) -> tuple:
+    """内部辅助：尝试使用 Mail.tm 及其镜像获取邮箱"""
     try:
         bases_shuffled = MAILTM_BASES[:]
         random.shuffle(bases_shuffled)
@@ -457,12 +440,33 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                     if tok:
                         print(f"[*] 使用服务商: {base}")
                         return email, tok, base
-
-        print("[Error] 所有邮箱服务商均失败")
-        return "", "", ""
     except Exception as e:
-        print(f"[Error] 请求邮箱 API 出错: {e}")
-        return "", "", ""
+        print(f"[Error] 请求 Mail.tm API 出错: {e}")
+    return "", "", ""
+
+
+def get_email_and_token(proxies: Any = None) -> tuple:
+    """创建临时邮箱并获取轮询凭证，自定义域名优先，其他免费服务商随机"""
+    if CUSTOM_EMAIL_DOMAIN and GMAIL_USER and GMAIL_APP_PASSWORD:
+        email = generate_custom_email()
+        print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({CUSTOM_EMAIL_DOMAIN})")
+        return email, "gmail_imap_token", "custom_gmail"
+
+    # 将所有免费的临时服务商放进列表后随机打乱遍历
+    providers = [
+        get_tempmail_lol_email,
+        get_guerrilla_email,
+        get_mailtm_email
+    ]
+    random.shuffle(providers)
+
+    for provider_func in providers:
+        email, token, provider_name = provider_func(proxies)
+        if email and token:
+            return email, token, provider_name
+
+    print("[Error] 所有临时邮箱服务商均尝试失败")
+    return "", "", ""
 
 
 def get_oai_code(token: str, email: str, proxies: Any = None, base: str = MAILTM_BASE) -> str:
