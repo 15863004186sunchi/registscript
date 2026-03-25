@@ -24,6 +24,124 @@ from faker import Faker
 from curl_cffi import requests
 
 # ==========================================
+# OpenAI Sentinel POW Solver (Anti-Bot)
+# ==========================================
+
+DEFAULT_SENTINEL_DIFF = "0fffff"
+DEFAULT_MAX_ITERATIONS = 500_000
+_SCREEN_SIGNATURES = (3000, 3120, 4000, 4160)
+_LANGUAGE_SIGNATURE = "en-US,es-US,en,es"
+_NAVIGATOR_KEYS = ("location", "ontransitionend", "onprogress")
+_WINDOW_KEYS = ("window", "document", "navigator")
+
+def _format_browser_time() -> str:
+    browser_now = datetime.now(timezone(timedelta(hours=-5)))
+    return browser_now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+
+def build_sentinel_config(user_agent: str) -> list:
+    perf_ms = time.perf_counter() * 1000
+    epoch_ms = (time.time() * 1000) - perf_ms
+    return [
+        random.choice(_SCREEN_SIGNATURES),
+        _format_browser_time(),
+        4294705152,
+        0,
+        user_agent,
+        "",
+        "",
+        "en-US",
+        _LANGUAGE_SIGNATURE,
+        0,
+        random.choice(_NAVIGATOR_KEYS),
+        "location",
+        random.choice(_WINDOW_KEYS),
+        perf_ms,
+        str(uuid.uuid4()),
+        "",
+        8,
+        epoch_ms,
+    ]
+
+def _encode_pow_payload(config: list, nonce: int) -> bytes:
+    prefix = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode("utf-8")
+    middle = (
+        "," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ","
+    ).encode("utf-8")
+    suffix = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode("utf-8")
+    body = prefix + str(nonce).encode("ascii") + middle + str(nonce >> 1).encode("ascii") + suffix
+    return base64.b64encode(body)
+
+def solve_sentinel_pow(seed: str, difficulty: str, config: list, max_iterations: int = DEFAULT_MAX_ITERATIONS) -> str:
+    seed_bytes = seed.encode("utf-8")
+    target = bytes.fromhex(difficulty)
+    prefix_length = len(target)
+    for nonce in range(max_iterations):
+        encoded = _encode_pow_payload(config, nonce)
+        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
+        if digest[:prefix_length] <= target:
+            return encoded.decode("ascii")
+    return ""
+
+def get_sentinel_pow_token(user_agent: str) -> str:
+    config = build_sentinel_config(user_agent)
+    seed = format(random.random())
+    solution = solve_sentinel_pow(seed, DEFAULT_SENTINEL_DIFF, config)
+    return f"gAAAAAC{solution}" if solution else ""
+
+def get_real_sentinel_token(did: str, flow: str, proxies: Any, ua: str) -> str:
+    """获取真正的 OpenAI Sentinel Token (包含 POW 求解)"""
+    p_token = get_sentinel_pow_token(ua)
+    try:
+        resp = requests.post(
+            "https://sentinel.openai.com/backend-api/sentinel/req",
+            headers={
+                "origin": "https://sentinel.openai.com",
+                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                "content-type": "text/plain;charset=UTF-8",
+                "user-agent": ua
+            },
+            data=json.dumps({"p": p_token, "id": did, "flow": flow}),
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            token = resp.json().get("token", "")
+            if token:
+                return f'{{"p": "", "t": "", "c": "{token}", "id": "{did}", "flow": "{flow}"}}'
+    except Exception as e:
+        print(f"[Error] Sentinel 请求失败: {e}")
+    return ""
+
+# ==========================================
+# 重定向追踪工具
+# ==========================================
+
+def follow_openai_redirects(s: requests.Session, start_url: str) -> str:
+    """跟随 OpenAI 的重定向链，找到最终的回调 URL"""
+    current_url = start_url
+    for i in range(10):
+        try:
+            resp = s.get(current_url, allow_redirects=False, timeout=15)
+            location = resp.headers.get("Location")
+            if not location:
+                # 如果没重定向了，看看当前 URL 是否就是回调
+                if "code=" in current_url and "state=" in current_url:
+                    return current_url
+                break
+            
+            # 构建完整 URL
+            current_url = urllib.parse.urljoin(current_url, location)
+            if "code=" in current_url and "state=" in current_url:
+                print(f"[*] 找到回调 URL (重定向 {i+1} 步)")
+                return current_url
+        except Exception as e:
+            print(f"[Error] 跟随重定向出错: {e}")
+            break
+    return ""
+
+
+# ==========================================
 # 行为抖动 & 身份随机化工具
 # ==========================================
 
@@ -393,6 +511,7 @@ def _mailtm_domains(proxies: Any = None, base: str = MAILTM_BASE) -> List[str]:
     else:
         items = []
 
+    blacklist = ["geeksun.ccwu.cc", "tempmail.icu", "mail.icu"]  # 排除已知的 OpenAI 黑名单/不可用域名
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -400,6 +519,8 @@ def _mailtm_domains(proxies: Any = None, base: str = MAILTM_BASE) -> List[str]:
         is_active = item.get("isActive", True)
         is_private = item.get("isPrivate", False)
         if domain and is_active and not is_private:
+            if domain in blacklist:
+                continue
             domains.append(domain)
 
     return domains
@@ -996,40 +1117,35 @@ def run(proxy: Optional[str]) -> Optional[str]:
             return None
 
         # ------------------------------------------------------------------
-        # 账号创建成功。即刻发起标准重登录流程 (Re-Login) 提取 Token
+        # [NEW] 启动“纯净 Session”重登录逻辑，绕过风控发码拦截
         # ------------------------------------------------------------------
-        print("[*] 注册完成，准备执行重新登录流程获取 Token...")
-        human_delay(1.0, 3.0)
+        print("[*] 注册完成，正在切换至纯净会话进行重登录...")
+        human_delay(2.0, 4.0)
         
-        # 1. 重新发起 OAuth 授权
-        login_oauth = generate_oauth_url()
-        s.get(login_oauth.auth_url, timeout=15)
+        # 1. 彻底清空并重新初始化 Session，更换 Device ID（规避重放拦截）
+        s = requests.Session()
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        s.headers.update({"user-agent": ua})
+
+        # 2. 重新发起 OAuth 授权流程，触发新的 Device ID
+        # 注意：这里必须复用最初生成的 oauth 对象，因为它是最终兑换 token 的凭证密钥对
+        login_oauth = oauth 
+        print("[*] 正在申请重登录专用的新 Device ID...")
+        s.get(login_oauth.auth_url, timeout=15, proxies=proxies)
         did = s.cookies.get("oai-did")
         if not did:
-            print("[Error] 重新登录时未获取到 oai-did")
+            print("[Error] 重新登录时未获取到新的 oai-did")
             return None
-            
-        print(f"[DEBUG] Re-Login Device ID: {did}")
-        human_delay(1.0, 2.0)
+        print(f"[DEBUG] Re-Login New Device ID: {did}")
 
-        # 2. 申请登录 Sentinel Token
-        sen_req_login = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
-        sen_resp_login = requests.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            headers={
-                "origin": "https://sentinel.openai.com",
-                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                "content-type": "text/plain;charset=UTF-8"
-            },
-            data=sen_req_login,
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        sen_token_login = sen_resp_login.json().get("token", "")
-        sentinel_login = f'{{"p": "", "t": "", "c": "{sen_token_login}", "id": "{did}", "flow": "authorize_continue"}}'
+        # 3. 计算并获取 Sentinel Login Token (含 POW 求解)
+        print("[*] 正在计算 Sentinel POW 算力题目...")
+        sentinel_login = get_real_sentinel_token(did, "authorize_continue", proxies, ua)
+        if not sentinel_login:
+            print("[Error] 重新登录时 Sentinel Token 获取失败")
+            return None
 
-        # 3. 提交登录入口意图 (screen_hint: login)
+        # 4. 提交登录入口意图 (username_password_login)
         login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
         auth_cont_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -1040,11 +1156,12 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "openai-sentinel-token": sentinel_login,
             },
             data=login_body,
+            proxies=proxies
         )
         print(f"[*] 提交登录意向状态: {auth_cont_resp.status_code}")
-        human_delay(1.0, 2.0)
+        human_delay(1.5, 3.0)
 
-        # 4. 提交登录密码 (正确的 /password/verify 端点)
+        # 5. 提交登录密码 (verify 阶段)
         pwd_body = json.dumps({"password": reg_password})
         pwd_resp = s.post(
             "https://auth.openai.com/api/accounts/password/verify",
@@ -1053,9 +1170,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "accept": "application/json",
                 "content-type": "application/json",
             },
-            data=pwd_body
+            data=pwd_body,
+            proxies=proxies
         )
-        print(f"[*] /password/verify 提交状态: {pwd_resp.status_code}")
+        print(f"[*] /password/verify 校验状态: {pwd_resp.status_code}")
         
         if pwd_resp.status_code != 200:
             print(f"[Error] 登录密码验证失败: {pwd_resp.text[:200]}")
@@ -1069,9 +1187,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
         print(f"[*] 登录后续流程: {page_type}")
 
         # 5. 判断是否触发登录侧 Email OTP 检查
+        # 6. 处理登录侧二次验证 (Email OTP)
         if page_type == "email_otp_verification":
-            print("[*] 触发登录二次验证 (Email OTP)，等待系统发送...")
-            human_delay(2.0, 5.0)
+            print("[*] 触发登录二次验证 (Email OTP)，等待发码...")
+            human_delay(4.0, 8.0)
             
             if mail_base == "custom_gmail":
                 login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
@@ -1083,10 +1202,9 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
                 
             if not login_otp:
-                print("[Error] 登录验证码获取失败")
+                print("[Error] 登录验证码获取超时或失败")
                 return None
                 
-            # 提交登录验证码
             otp_val_resp = s.post(
                 "https://auth.openai.com/api/accounts/email-otp/validate",
                 headers={
@@ -1094,69 +1212,59 @@ def run(proxy: Optional[str]) -> Optional[str]:
                     "accept": "application/json", 
                     "content-type": "application/json"
                 },
-                data=json.dumps({"code": login_otp})
+                data=json.dumps({"code": login_otp}),
+                proxies=proxies
             )
-            print(f"[*] 登录密码OTP校验状态: {otp_val_resp.status_code}")
+            print(f"[*] 登录验证码校验状态: {otp_val_resp.status_code}")
             if otp_val_resp.status_code != 200:
                 print(f"[Error] 登录验证码校验失败: {otp_val_resp.text[:200]}")
                 return None
             human_delay(1.0, 2.0)
 
-        # 6. 从成功会话中提取 Web 会话 JWT 并读取 workspace_id
+        # 7. 提取授权 Session 并选择 Workspace
         auth_cookie = s.cookies.get("oai-client-auth-session")
         if not auth_cookie:
-             print("[Error] 重登录流程完成后仍未获取到 auth Cookie")
+             print("[Error] 重登录完成后未获取到关键 auth Cookie")
              return None
              
         auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
         workspaces = auth_json.get("workspaces") or []
-
         if not workspaces:
-            print("[Error] 最终授权 Cookie 中缺失 workspace，登录状态不完整")
+            print("[Error] 授权 Cookie 中缺失租户列表")
             return None
 
         workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-        print(f"[*] 选择工作区 ID: {workspace_id}")
+        print(f"[*] 自动选择第一个工作区: {workspace_id}")
         
         select_resp = s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
-            headers={"content-type": "application/json"},
-            data=f'{{"workspace_id":"{workspace_id}"}}'
+            headers={"content-type": "application/json", "referer": "https://auth.openai.com/workspace-select"},
+            data=f'{{"workspace_id":"{workspace_id}"}}',
+            proxies=proxies
         )
         if select_resp.status_code != 200:
-            print(f"[Error] 工作区选择失败: {select_resp.status_code}")
+            print(f"[Error] 工作区选择接口返回报错: {select_resp.status_code}")
             return None
 
+        # 8. 跟随重定向链，获取 OAuth 最终回调
         continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
         if not continue_url:
-            print("[Error] workspace/select 响应里缺少 continue_url")
+            print("[Error] 响应内缺失 continue_url 跳转链接")
             return None
 
-        current_url = continue_url
-        for _ in range(6):
-            final_resp = s.get(current_url, allow_redirects=False, timeout=15)
-            location = final_resp.headers.get("Location") or ""
-
-            if final_resp.status_code not in [301, 302, 303, 307, 308]:
-                break
-            if not location:
-                break
-
-            next_url = urllib.parse.urljoin(current_url, location)
-            if "code=" in next_url and "state=" in next_url:
-                return submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-            current_url = next_url
-
-        print("[Error] 未能在重定向链中捕获到最终 Callback URL")
-        return None
+        print("[*] 正在追踪 OAuth 重定向链条...")
+        final_callback_url = follow_openai_redirects(s, continue_url)
+        if not final_callback_url:
+            print("[Error] 未能在 10 步跳转内截获回调地址")
+            return None
+        
+        # 9. 执行最终的 Token 兑换，输出结果
+        print("[*] 回调已捕获，执行 Token 交换协议...")
+        ret = submit_callback_url(s, final_callback_url, login_oauth.code_verifier, proxies)
+        return ret
 
     except Exception as e:
-        print(f"[Error] 运行时发生错误: {e}")
+        print(f"[Error] 运行时异常: {e}")
         return None
 
 
