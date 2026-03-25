@@ -461,13 +461,12 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({CUSTOM_EMAIL_DOMAIN})")
         return email, "gmail_imap_token", "custom_gmail"
 
-    # 将所有免费的临时服务商放进列表后随机打乱遍历
+    # 按反封禁通过率设置优先级（不要倒序或打乱）
     providers = [
-        get_tempmail_lol_email,
+        get_tempmail_lol_email,  # 成功率目前最高
         get_guerrilla_email,
         get_mailtm_email
     ]
-    random.shuffle(providers)
 
     for provider_func in providers:
         email, token, provider_name = provider_func(proxies)
