@@ -157,6 +157,68 @@ def get_gmail_otp(recipient_email: str, proxies: Any = None) -> str:
 
 
 # ==========================================
+# Tempmail.lol 临时邮箱 API（最新添加，第一优先级）
+# ==========================================
+TEMPMAIL_LOL_API = "https://api.tempmail.lol/v2"
+
+def get_tempmail_lol_email(proxies: Any = None) -> tuple:
+    try:
+        resp = requests.post(f"{TEMPMAIL_LOL_API}/inbox/create", json={}, proxies=proxies, impersonate="chrome", timeout=15)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            email = str(data.get("address", "")).strip()
+            token = str(data.get("token", "")).strip()
+            if email and token:
+                print(f"[*] 使用服务商: Tempmail.lol")
+                return email, token, "tempmail_lol"
+    except Exception as e:
+        print(f"[Error] Tempmail.lol 初始化失败: {e}")
+    return "", "", ""
+
+def get_tempmail_lol_code(token: str, email: str, proxies: Any = None) -> str:
+    regex = r"(?<!\d)(\d{6})(?!\d)"
+    seen_ids: set = set()
+    print(f"[*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+
+    for _ in range(40):
+        print(".", end="", flush=True)
+        try:
+            resp = requests.get(
+                f"{TEMPMAIL_LOL_API}/inbox",
+                params={"token": token},
+                headers={"Accept": "application/json"},
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                emails = data.get("emails", []) if isinstance(data, dict) else []
+                for msg in emails:
+                    if not isinstance(msg, dict): continue
+                    msg_date = msg.get("date", 0)
+                    if not msg_date or msg_date in seen_ids: continue
+                    seen_ids.add(msg_date)
+
+                    sender = str(msg.get("from", "")).lower()
+                    subject = str(msg.get("subject", ""))
+                    body = str(msg.get("body", ""))
+                    html = str(msg.get("html", ""))
+                    content = f"{sender}\n{subject}\n{body}\n{html}"
+
+                    if "openai" in sender or "openai" in content.lower():
+                        m = re.search(regex, content)
+                        if m:
+                            print(" 抓到啦! 验证码:", m.group(1))
+                            return m.group(1)
+        except Exception:
+            pass
+        time.sleep(3)
+    print(" 超时，未收到验证码")
+    return ""
+
+
+# ==========================================
 # Guerrilla Mail 临时邮箱（优先使用，域名未被 OpenAI 批量屏蔽）
 # ==========================================
 
@@ -340,6 +402,11 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         email = generate_custom_email()
         print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({CUSTOM_EMAIL_DOMAIN})")
         return email, "gmail_imap_token", "custom_gmail"
+
+    # === 第一优先级：Tempmail.lol (免配置，无拦截) ===
+    email, token, provider = get_tempmail_lol_email(proxies)
+    if email and token:
+        return email, token, provider
 
     # === 第二优先级：Guerrilla Mail（域名把控独立，被封概率低）===
     email, token, provider = get_guerrilla_email(proxies)
@@ -866,6 +933,8 @@ def run(proxy: Optional[str]) -> Optional[str]:
         # 根据邮箱服务商选择对应的验证码轮询函数
         if mail_base == "custom_gmail":
             code = get_gmail_otp(email, proxies)
+        elif mail_base == "tempmail_lol":
+            code = get_tempmail_lol_code(dev_token, email, proxies)
         elif mail_base == "guerrilla":
             code = get_guerrilla_code(dev_token, email, proxies)
         else:
@@ -988,6 +1057,8 @@ def run(proxy: Optional[str]) -> Optional[str]:
             
             if mail_base == "custom_gmail":
                 login_otp = get_gmail_otp(email, proxies)
+            elif mail_base == "tempmail_lol":
+                login_otp = get_tempmail_lol_code(dev_token, email, proxies)
             elif mail_base == "guerrilla":
                 login_otp = get_guerrilla_code(dev_token, email, proxies)
             else:
