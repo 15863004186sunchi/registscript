@@ -213,8 +213,9 @@ def generate_custom_email() -> str:
 
 def get_gmail_otp(recipient_email: str, proxies: Any = None, ignore_code: str = "") -> str:
     """
-    通过 Gmail IMAP 轮询，找到转发自 OpenAI 的邮件并提取 6 位验证码。
-    同时检查 INBOX 和 [Gmail]/Spam 文件夹，避免因垃圾邮件过滤而漏读。
+    通过 Gmail IMAP 轮询提取验证码。
+    改进点：不再仅依赖 UNSEEN 标记，因为用户手动预览或 Gmail 自动加载可能会清除未读状态。
+    逻辑：获取最新的 15 封来自 openai.com 的邮件，排除掉 ignore_code 后返回第一个符合 6 位数字格式的代码。
     """
     import imaplib
     import email as emaillib
@@ -234,13 +235,15 @@ def get_gmail_otp(recipient_email: str, proxies: Any = None, ignore_code: str = 
 
                 for folder in folders_to_check:
                     try:
-                        status, _ = imap.select(folder, readonly=False)
+                        status, _ = imap.select(folder, readonly=True) # 使用只读模式避免干扰标记
                         if status != "OK":
                             continue
 
-                        # 搜索来自 openai.com 的未读邮件
-                        _, msg_ids = imap.search(None, 'UNSEEN FROM "openai.com"')
-                        for num in (msg_ids[0].split() or [])[-10:]:
+                        # 搜索来自 openai.com 的邮件（包含已读和未读）
+                        _, msg_ids = imap.search(None, 'FROM "openai.com"')
+                        # 取最新的 10 个数据
+                        target_ids = (msg_ids[0].split() or [])[-10:]
+                        for num in reversed(target_ids): # 从最新的开始处理
                             if num in seen_ids:
                                 continue
                             seen_ids.add(num)
@@ -250,42 +253,37 @@ def get_gmail_otp(recipient_email: str, proxies: Any = None, ignore_code: str = 
                                 continue
 
                             msg = emaillib.message_from_bytes(data[0][1])
-
-                            # 检查收件人是否匹配
+                            # 检查收件人（支持 Cloudflare 转发后的 To 头）
                             to_header = str(msg.get("To") or "").lower()
-                            local_part = recipient_email.split("@")[0].lower()
-                            if local_part not in to_header and recipient_email.lower() not in to_header:
+                            if recipient_email.lower() not in to_header and recipient_email.split("@")[0].lower() not in to_header:
                                 continue
 
-                            # 提取邮件正文
+                            # 提取正文
                             body = ""
                             if msg.is_multipart():
                                 for part in msg.walk():
-                                    ct = part.get_content_type()
-                                    if ct in ("text/plain", "text/html"):
+                                    if part.get_content_type() in ("text/plain", "text/html"):
                                         try:
                                             body += part.get_payload(decode=True).decode("utf-8", "replace")
-                                        except Exception:
-                                            pass
+                                        except: pass
                             else:
                                 try:
                                     body = msg.get_payload(decode=True).decode("utf-8", "replace")
-                                except Exception:
+                                except:
                                     body = str(msg.get_payload())
 
                             m = re.search(regex, body)
                             if m:
                                 code = m.group(1)
                                 if ignore_code and code == ignore_code:
+                                    # 抓到了旧的记录，继续找
                                     continue
-                                # 标记为已读
-                                imap.store(num, "+FLAGS", "\\Seen")
-                                print(" 抓到啦! 验证码:", code)
+                                print(f" 抓到啦! 验证码: {code}")
                                 return code
                     except Exception:
                         continue
-        except Exception as e:
-            pass  # 网络抖动时静默重试
+        except Exception:
+            pass
 
         time.sleep(3)
 
@@ -1174,6 +1172,8 @@ def run(proxy: Optional[str]) -> Optional[str]:
         human_delay(1.5, 3.0)
 
         # 提交密码
+        # 提交密码 (重新获取一次 Sentinel Token，确保时效性)
+        sentinel_pwd = get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_login
         pwd_body = json.dumps({"password": reg_password})
         pwd_resp = s.post(
             "https://auth.openai.com/api/accounts/password/verify",
@@ -1181,7 +1181,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "referer": "https://auth.openai.com/log-in/password",
                 "accept": "application/json",
                 "content-type": "application/json",
-                "openai-sentinel-token": sentinel_login,
+                "openai-sentinel-token": sentinel_pwd,
             },
             data=pwd_body,
             proxies=proxies
@@ -1192,14 +1192,15 @@ def run(proxy: Optional[str]) -> Optional[str]:
             print(f"[Error] 登录密码校验失败: {pwd_resp.text[:200]}")
             return None
 
-        # ★ 关键修复：密码验证后主动发送登录验证码，而不是被动等待 page_type
-        # Issue #62: 走登录流程直接再发一遍验证码，再接收一遍就行
-        print("[*] 主动触发登录验证码发送...")
+        # ★ 关键修复：主动发送登录验证码，并携带 Sentinel Token 绕过风控拦截
+        print("[*] 正在刷新 Sentinel 算力并触发登录验证码发送...")
+        sentinel_otp = get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_pwd
         login_otp_send_resp = s.get(
             "https://auth.openai.com/api/accounts/email-otp/send",
             headers={
                 "referer": "https://auth.openai.com/log-in/email-otp",
                 "accept": "application/json",
+                "openai-sentinel-token": sentinel_otp,
             },
             proxies=proxies
         )
