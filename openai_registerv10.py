@@ -1132,31 +1132,30 @@ def run(proxy: Optional[str]) -> Optional[str]:
         # 启动重登录逻辑，获取最终 Token
         # ★ 根据 Issue #62：复用注册阶段已初始化的 oauth 对象（state/verifier 必须一致）
         # ------------------------------------------------------------------
-        print("[*] 注册完成，进入重登录阶段...")
+        # ------------------------------------------------------------------
+        # 启动重登录逻辑 (借鉴 back_gao.py 的高稳定性闭环流程)
+        # ------------------------------------------------------------------
+        print("[*] 注册完成，彻底解耦并启动静默重登录...")
         human_delay(5.0, 10.0)
         
         s = requests.Session()
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
         s.headers.update({"user-agent": ua})
 
-        # ★ 关键修复：复用原始 oauth 对象，而不是生成新的
-        # 新建 oauth 会导致 state 不匹配，Token 交换时报错
-        login_oauth = oauth
-        s.get(login_oauth.auth_url, timeout=15, proxies=proxies)
+        # ★ 借鉴点 1：完全重新生成 OAuth URL (不再复用，避免 Session 串扰)
+        login_start_oauth = generate_oauth_url()
+        s.get(login_start_oauth.auth_url, timeout=15, proxies=proxies)
+        
         did = s.cookies.get("oai-did")
         if not did:
-            print("[Error] 未获取到登录 Device ID")
+            print("[Error] 登录阶段获取 Device ID 失败")
             return None
-        print(f"[DEBUG] Re-Login Device ID: {did}")
+        print(f"[DEBUG] Re-Login DID: {did}")
 
-        print("[*] 正在计算登录 Sentinel Token...")
+        # ★ 借鉴点 2：逐步分阶段校验
+        # 1. 提交登录意向
         sentinel_login = get_real_sentinel_token(did, "authorize_continue", proxies, ua)
-        if not sentinel_login:
-            print("[Error] Sentinel Token 计算失败")
-            return None
-
-        # 提交登录入口意图
-        login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
+        login_init_body = json.dumps({"username": {"value": email, "kind": "email"}, "screen_hint": "login"})
         auth_cont_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
             headers={
@@ -1165,14 +1164,13 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "content-type": "application/json",
                 "openai-sentinel-token": sentinel_login,
             },
-            data=login_body,
+            data=login_init_body,
             proxies=proxies
         )
-        print(f"[*] 登录意向状态: {auth_cont_resp.status_code}")
-        human_delay(1.5, 3.0)
+        print(f"[*] 登录开始意向状态: {auth_cont_resp.status_code}")
+        human_delay(2.0, 4.0)
 
-        # 提交密码
-        # 提交密码 (重新获取一次 Sentinel Token，确保时效性)
+        # 2. 校验密码并获取 page 状态
         sentinel_pwd = get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_login
         pwd_body = json.dumps({"password": reg_password})
         pwd_resp = s.post(
@@ -1189,38 +1187,73 @@ def run(proxy: Optional[str]) -> Optional[str]:
         print(f"[*] 登录密码校验状态: {pwd_resp.status_code}")
         
         if pwd_resp.status_code != 200:
-            print(f"[Error] 登录密码校验失败: {pwd_resp.text[:200]}")
+            print(f"[Error] 登录失败: {pwd_resp.text[:200]}")
             return None
 
-        # ★ 关键修复：主动发送登录验证码，并携带 Sentinel Token 绕过风控拦截
-        print("[*] 正在刷新 Sentinel 算力并触发登录验证码发送...")
-        sentinel_otp = get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_pwd
-        login_otp_send_resp = s.get(
-            "https://auth.openai.com/api/accounts/email-otp/send",
-            headers={
-                "referer": "https://auth.openai.com/log-in/email-otp",
-                "accept": "application/json",
-                "openai-sentinel-token": sentinel_otp,
-            },
-            proxies=proxies
-        )
-        print(f"[*] 登录验证码发送状态: {login_otp_send_resp.status_code}")
-        human_delay(5.0, 10.0)  # 等待邮件送达
+        # ★ 借鉴点 3：阶梯式轮询 + 自动 Resend
+        # 如果页面指示需要 OTP，则开启 5 轮“尝试-重发”大循环
+        try:
+            pwd_json = pwd_resp.json()
+            page_type = (pwd_json.get("page") or {}).get("type", "")
+            need_login_otp = "otp" in page_type or "verify" in str(pwd_json.get("continue_url", ""))
+        except:
+            need_login_otp = True # 默认兜底开启验证
 
-        # 轮询登录验证码
-        if mail_base == "custom_gmail":
-            login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
-        elif mail_base == "tempmail_lol":
-            login_otp = get_tempmail_lol_code(dev_token, email, proxies, ignore_code=reg_otp)
-        elif mail_base == "guerrilla":
-            login_otp = get_guerrilla_code(dev_token, email, proxies, ignore_code=reg_otp)
-        else:
-            login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
+        login_otp = ""
+        if need_login_otp:
+            print("[*] 登录触发二次验证，开启“尝试-重发”五阶段轮询...")
+            for attempt in range(5):
+                if attempt > 0:
+                    print(f"\n[*] 验证码重试 ({attempt}/5)，主动触发重发接口...")
+                    try:
+                        s.post(
+                            "https://auth.openai.com/api/accounts/email-otp/resend",
+                            headers={
+                                "openai-sentinel-token": get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_pwd,
+                                "content-type": "application/json",
+                            },
+                            json={},
+                            proxies=proxies,
+                            timeout=15
+                        )
+                    except: pass
+                    time.sleep(3)
+
+                # 每个轮询阶段大约 30 秒
+                if mail_base == "custom_gmail":
+                    login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
+                elif mail_base == "tempmail_lol":
+                    login_otp = get_tempmail_lol_code(dev_token, email, proxies, ignore_code=reg_otp)
+                else:
+                    login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
+
+                if login_otp:
+                    break
             
-        if not login_otp:
-            print("[Error] 登录验证码获取超时")
-            return None
-        print(f"[*] 成功获取登录验证码: {login_otp}")
+            if not login_otp:
+                print("[Error] 多次重发后仍未收到登录验证码")
+                return None
+            print(f"[*] 成功获取登录验证码: {login_otp}")
+
+            # 3. 校验登录验证码
+            sentinel_val = get_real_sentinel_token(did, "authorize_continue", proxies, ua) or sentinel_pwd
+            val_resp = s.post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/log-in/email-otp",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel_val,
+                },
+                json={"code": login_otp},
+                proxies=proxies
+            )
+            print(f"[*] 登录验证码校验完成: {val_resp.status_code}")
+            if val_resp.status_code != 200:
+                print(f"[Error] 登录验证失败: {val_resp.text[:200]}")
+                return None
+        else:
+            print("[*] 极速通过：本次登录无需二次邮箱验证")
             
         otp_val_resp = s.post(
             "https://auth.openai.com/api/accounts/email-otp/validate",
