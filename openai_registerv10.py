@@ -1115,6 +1115,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
 
         # ------------------------------------------------------------------
         # 启动重登录逻辑，获取最终 Token
+        # ★ 根据 Issue #62：复用注册阶段已初始化的 oauth 对象（state/verifier 必须一致）
         # ------------------------------------------------------------------
         print("[*] 注册完成，进入重登录阶段...")
         human_delay(5.0, 10.0)
@@ -1123,12 +1124,15 @@ def run(proxy: Optional[str]) -> Optional[str]:
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
         s.headers.update({"user-agent": ua})
 
-        login_oauth = generate_oauth_url() 
+        # ★ 关键修复：复用原始 oauth 对象，而不是生成新的
+        # 新建 oauth 会导致 state 不匹配，Token 交换时报错
+        login_oauth = oauth
         s.get(login_oauth.auth_url, timeout=15, proxies=proxies)
         did = s.cookies.get("oai-did")
         if not did:
             print("[Error] 未获取到登录 Device ID")
             return None
+        print(f"[DEBUG] Re-Login Device ID: {did}")
 
         print("[*] 正在计算登录 Sentinel Token...")
         sentinel_login = get_real_sentinel_token(did, "authorize_continue", proxies, ua)
@@ -1136,6 +1140,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
             print("[Error] Sentinel Token 计算失败")
             return None
 
+        # 提交登录入口意图
         login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
         auth_cont_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -1148,9 +1153,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
             data=login_body,
             proxies=proxies
         )
-        print(f"[*] 登录开始意向状态: {auth_cont_resp.status_code}")
+        print(f"[*] 登录意向状态: {auth_cont_resp.status_code}")
         human_delay(1.5, 3.0)
 
+        # 提交密码
         pwd_body = json.dumps({"password": reg_password})
         pwd_resp = s.post(
             "https://auth.openai.com/api/accounts/password/verify",
@@ -1168,40 +1174,53 @@ def run(proxy: Optional[str]) -> Optional[str]:
         if pwd_resp.status_code != 200:
             print(f"[Error] 登录密码校验失败: {pwd_resp.text[:200]}")
             return None
-            
-        pwd_json = pwd_resp.json() if pwd_resp.status_code == 200 else {}
-        page_type = str(pwd_json.get("page", {}).get("type", "")).strip()
 
-        if page_type == "email_otp_verification":
-            print("[*] 触发二次验证，轮询登录验证码...")
-            human_delay(8.0, 15.0)
-            
-            if mail_base == "custom_gmail":
-                login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
-            elif mail_base == "tempmail_lol":
-                login_otp = get_tempmail_lol_code(dev_token, email, proxies, ignore_code=reg_otp)
-            elif mail_base == "guerrilla":
-                login_otp = get_guerrilla_code(dev_token, email, proxies, ignore_code=reg_otp)
-            else:
-                login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
-                
-            if not login_otp:
-                print("[Error] 登录验证码获取超时")
-                return None
-                
-            otp_val_resp = s.post(
-                "https://auth.openai.com/api/accounts/email-otp/validate",
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json", 
-                    "content-type": "application/json"
-                },
-                data=json.dumps({"code": login_otp}),
-                proxies=proxies
-            )
-            print(f"[*] 登录验证码校验状态: {otp_val_resp.status_code}")
-            human_delay(2.0, 4.0)
+        # ★ 关键修复：密码验证后主动发送登录验证码，而不是被动等待 page_type
+        # Issue #62: 走登录流程直接再发一遍验证码，再接收一遍就行
+        print("[*] 主动触发登录验证码发送...")
+        login_otp_send_resp = s.get(
+            "https://auth.openai.com/api/accounts/email-otp/send",
+            headers={
+                "referer": "https://auth.openai.com/log-in/email-otp",
+                "accept": "application/json",
+            },
+            proxies=proxies
+        )
+        print(f"[*] 登录验证码发送状态: {login_otp_send_resp.status_code}")
+        human_delay(5.0, 10.0)  # 等待邮件送达
 
+        # 轮询登录验证码
+        if mail_base == "custom_gmail":
+            login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
+        elif mail_base == "tempmail_lol":
+            login_otp = get_tempmail_lol_code(dev_token, email, proxies, ignore_code=reg_otp)
+        elif mail_base == "guerrilla":
+            login_otp = get_guerrilla_code(dev_token, email, proxies, ignore_code=reg_otp)
+        else:
+            login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
+            
+        if not login_otp:
+            print("[Error] 登录验证码获取超时")
+            return None
+        print(f"[*] 成功获取登录验证码: {login_otp}")
+            
+        otp_val_resp = s.post(
+            "https://auth.openai.com/api/accounts/email-otp/validate",
+            headers={
+                "referer": "https://auth.openai.com/log-in/email-otp",
+                "accept": "application/json", 
+                "content-type": "application/json"
+            },
+            data=json.dumps({"code": login_otp}),
+            proxies=proxies
+        )
+        print(f"[*] 登录验证码校验状态: {otp_val_resp.status_code}")
+        if otp_val_resp.status_code != 200:
+            print(f"[Error] 登录验证码校验失败: {otp_val_resp.text[:200]}")
+            return None
+        human_delay(2.0, 4.0)
+
+        # 解析 auth Cookie 获取 workspace 列表
         auth_cookie = s.cookies.get("oai-client-auth-session")
         if not auth_cookie:
              print("[Error] 缺失 auth Cookie")
@@ -1209,27 +1228,32 @@ def run(proxy: Optional[str]) -> Optional[str]:
              
         auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
         workspaces = auth_json.get("workspaces") or []
+        if not workspaces:
+            print("[Error] 授权 Cookie 中缺失 workspace 列表")
+            return None
         workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+        print(f"[*] 选择工作区: {workspace_id}")
         
-        s.post(
+        select_resp = s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
             headers={"content-type": "application/json", "referer": "https://auth.openai.com/workspace-select"},
             data=f'{{"workspace_id":"{workspace_id}"}}',
             proxies=proxies
         )
+        if select_resp.status_code != 200:
+            print(f"[Error] workspace 选择失败: {select_resp.status_code}")
+            return None
 
-        continue_url = str((s.cookies.get("oai-client-auth-session-continue-url") or "")).strip()
-        # 如果 cookie 没存，尝试从之前的 json 拿
+        # 从 workspace/select 响应中获取 continue_url，跟踪重定向链
+        continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
         if not continue_url:
-            # 兼容逻辑
-            pass 
-
-        print("[*] 追踪重定向链...")
-        # 重新获取跳转链接（如果 select_resp 有的话）
-        # 这里为了简化，我们直接用跳转追踪器从授权后的初始 URL 开始
-        final_callback_url = follow_openai_redirects(s, f"https://auth.openai.com/api/accounts/workspace/select?workspace_id={workspace_id}", proxies=proxies)
+            print("[Error] 缺失 continue_url")
+            return None
+        
+        print("[*] 追踪 OAuth 重定向链...")
+        final_callback_url = follow_openai_redirects(s, continue_url, proxies=proxies)
         if not final_callback_url:
-            print("[Error] 重定向追踪失败")
+            print("[Error] 重定向追踪失败，未捕获到回调 URL")
             return None
         
         print("[*] 准备兑换最终 Token...")
