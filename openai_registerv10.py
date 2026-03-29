@@ -184,16 +184,32 @@ def save_credentials(email: str, password: str, token_file: str = "") -> None:
 # ==========================================
 
 # ⚙️ 配置区（根据你的实际信息填写）
-CUSTOM_EMAIL_DOMAIN = ""          # Cloudflare 托管的域名 (填空则自动使用随机公共短邮箱)
-GMAIL_USER          = ""          # 接收转发的 Gmail 地址
-GMAIL_APP_PASSWORD  = ""          # Gmail 应用专用密码（去掉空格）
+# 支持多域名：每次注册时从列表中随机选一个，提升通过率
+CUSTOM_EMAIL_DOMAINS = [
+    "geeksun.cc.cd",
+    "geeksun.ccwu.cc",
+    "geeksun.us.ci",
+]                                    # Cloudflare Email Routing 托管的域名列表（留空列表则使用随机公共邮箱）
+CUSTOM_EMAIL_DOMAIN  = ""          # 兼容旧字段（单域名模式，留空即走多域名逻辑）
+GMAIL_USER           = "geeksunchi@gmail.com"  # 接收转发的 Gmail 地址
+GMAIL_APP_PASSWORD   = ""          # Gmail 应用专用密码（去掉空格后填入）
+
+
+def _pick_custom_domain() -> str:
+    """从多域名列表中随机选一个；若旧字段 CUSTOM_EMAIL_DOMAIN 有值则优先使用。"""
+    if CUSTOM_EMAIL_DOMAIN:
+        return CUSTOM_EMAIL_DOMAIN
+    if CUSTOM_EMAIL_DOMAINS:
+        return random.choice(CUSTOM_EMAIL_DOMAINS)
+    return ""
 
 
 def generate_custom_email() -> str:
-    """用自定义域名生成一个随机邮箱地址"""
+    """随机生成一个基于 Cloudflare 域名转发的邮箱地址，每次注册换一个域名"""
+    domain = _pick_custom_domain()
     prefix = "".join(random.choices(string.ascii_lowercase, k=random.randint(3, 5)))
     local = f"{prefix}{secrets.token_hex(4)}"
-    return f"{local}@{CUSTOM_EMAIL_DOMAIN}"
+    return f"{local}@{domain}"
 
 def get_gmail_otp(recipient_email: str, proxies: Any = None, ignore_code: str = "") -> str:
     """
@@ -577,9 +593,10 @@ def get_mailtm_email(proxies: Any = None) -> tuple:
 
 def get_email_and_token(proxies: Any = None) -> tuple:
     """创建临时邮箱并获取轮询凭证，自定义域名优先，其他免费服务商随机"""
-    if CUSTOM_EMAIL_DOMAIN and GMAIL_USER and GMAIL_APP_PASSWORD:
+    if (CUSTOM_EMAIL_DOMAINS or CUSTOM_EMAIL_DOMAIN) and GMAIL_USER and GMAIL_APP_PASSWORD:
         email = generate_custom_email()
-        print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({CUSTOM_EMAIL_DOMAIN})")
+        domain = email.split("@")[-1]
+        print(f"[*] 使用服务商: 自定义域名 + Gmail IMAP ({domain})")
         return email, "gmail_imap_token", "custom_gmail"
 
     # 按反封禁通过率设置优先级（不要倒序或打乱）
