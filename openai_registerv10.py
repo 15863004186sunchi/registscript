@@ -192,7 +192,7 @@ CUSTOM_EMAIL_DOMAINS = [
 ]                                    # Cloudflare Email Routing 托管的域名列表（留空列表则使用随机公共邮箱）
 CUSTOM_EMAIL_DOMAIN  = ""          # 兼容旧字段（单域名模式，留空即走多域名逻辑）
 GMAIL_USER           = "geeksunchi@gmail.com"  # 接收转发的 Gmail 地址
-GMAIL_APP_PASSWORD   = ""          # Gmail 应用专用密码（去掉空格后填入）
+GMAIL_APP_PASSWORD   = "jcfk oprb igpm wbwh"          # Gmail 应用专用密码（去掉空格后填入）
 
 
 def _pick_custom_domain() -> str:
