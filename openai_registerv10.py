@@ -117,12 +117,12 @@ def get_real_sentinel_token(did: str, flow: str, proxies: Any, ua: str) -> str:
 # 重定向追踪工具
 # ==========================================
 
-def follow_openai_redirects(s: requests.Session, start_url: str) -> str:
+def follow_openai_redirects(s: requests.Session, start_url: str, proxies: Any = None) -> str:
     """跟随 OpenAI 的重定向链，找到最终的回调 URL"""
     current_url = start_url
     for i in range(10):
         try:
-            resp = s.get(current_url, allow_redirects=False, timeout=15)
+            resp = s.get(current_url, allow_redirects=False, timeout=15, proxies=proxies)
             location = resp.headers.get("Location")
             if not location:
                 # 如果没重定向了，看看当前 URL 是否就是回调
@@ -780,30 +780,27 @@ def _to_int(v: Any) -> int:
         return 0
 
 
-def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
-    body = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
+def _post_form(url: str, data: Dict[str, str], timeout: int = 30, proxies: Any = None) -> Dict[str, Any]:
+    """发送 POST 表单请求，支持代理和浏览器指纹"""
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    }
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"token exchange failed: {resp.status}: {raw.decode('utf-8', 'replace')}"
-                )
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        raise RuntimeError(
-            f"token exchange failed: {exc.code}: {raw.decode('utf-8', 'replace')}"
-        ) from exc
+        resp = requests.post(
+            url,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            proxies=proxies,
+            impersonate="chrome"
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"token exchange failed: {resp.status_code}: {resp.text}")
+        return resp.json()
+    except Exception as e:
+        raise RuntimeError(f"token exchange failed: {e}") from e
 
 
 @dataclass(frozen=True)
@@ -848,6 +845,7 @@ def submit_callback_url(
     expected_state: str,
     code_verifier: str,
     redirect_uri: str = DEFAULT_REDIRECT_URI,
+    proxies: Any = None,
 ) -> str:
     cb = _parse_callback_url(callback_url)
     if cb["error"]:
@@ -870,6 +868,7 @@ def submit_callback_url(
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
         },
+        proxies=proxies
     )
 
     access_token = (token_resp.get("access_token") or "").strip()
@@ -1058,15 +1057,13 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "accept": "application/json",
                 "content-type": "application/json",
             },
+            proxies=proxies
         )
         print(f"[*] 验证码发送状态: {otp_resp.status_code}")
         if otp_resp.status_code != 200:
-            # === 诊断：打印 send-otp 错误详情 ===
             print(f"[DEBUG] send-otp 响应体: {otp_resp.text[:500]}")
-            print(f"[DEBUG] 当前邮箱域名: {email.split('@')[-1]}")
-        human_delay(2.0, 5.0)  # 模拟用户切换到邮箱/等待验证码
+        human_delay(2.0, 5.0)
 
-        # 根据邮箱服务商选择对应的验证码轮询函数
         if mail_base == "custom_gmail":
             code = get_gmail_otp(email, proxies)
         elif mail_base == "tempmail_lol":
@@ -1080,7 +1077,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
             return None
             
         reg_otp = code
-        human_delay(1.0, 3.0)  # 模拟用户手动输入验证码
+        human_delay(1.0, 3.0)
 
         code_body = f'{{"code":"{code}"}}'
         code_resp = s.post(
@@ -1091,9 +1088,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "content-type": "application/json",
             },
             data=code_body,
+            proxies=proxies
         )
         print(f"[*] 验证码校验状态: {code_resp.status_code}")
-        human_delay(1.5, 3.5)  # 模拟用户填写个人信息页面的停留时间
+        human_delay(1.5, 3.5)
 
         reg_name, reg_birthdate = generate_random_identity()
         print(f"[*] 本次注册身份: {reg_name} / {reg_birthdate}")
@@ -1106,46 +1104,38 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "content-type": "application/json",
             },
             data=create_account_body,
+            proxies=proxies
         )
         create_account_status = create_account_resp.status_code
         print(f"[*] 账户创建状态: {create_account_status}")
-        print(f"[DEBUG] create_account 响应体: {create_account_resp.text[:500]}")
-        print(f"[DEBUG] create_account Set-Cookie: {create_account_resp.headers.get('Set-Cookie', '(无)')[:120]}...")
 
         if create_account_status != 200:
-            print(create_account_resp.text)
+            print(f"[DEBUG] 注册失败响应: {create_account_resp.text[:200]}")
             return None
 
         # ------------------------------------------------------------------
-        # [NEW] 启动“纯净 Session”重登录逻辑，绕过风控发码拦截
+        # 启动重登录逻辑，获取最终 Token
         # ------------------------------------------------------------------
-        print("[*] 注册完成，正在切换至纯净会话进行重登录...")
-        human_delay(2.0, 4.0)
+        print("[*] 注册完成，进入重登录阶段...")
+        human_delay(5.0, 10.0)
         
-        # 1. 彻底清空并重新初始化 Session，更换 Device ID（规避重放拦截）
         s = requests.Session()
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
         s.headers.update({"user-agent": ua})
 
-        # 2. 重新发起 OAuth 授权流程，触发新的 Device ID
-        # 注意：这里必须复用最初生成的 oauth 对象，因为它是最终兑换 token 的凭证密钥对
-        login_oauth = oauth 
-        print("[*] 正在申请重登录专用的新 Device ID...")
+        login_oauth = generate_oauth_url() 
         s.get(login_oauth.auth_url, timeout=15, proxies=proxies)
         did = s.cookies.get("oai-did")
         if not did:
-            print("[Error] 重新登录时未获取到新的 oai-did")
+            print("[Error] 未获取到登录 Device ID")
             return None
-        print(f"[DEBUG] Re-Login New Device ID: {did}")
 
-        # 3. 计算并获取 Sentinel Login Token (含 POW 求解)
-        print("[*] 正在计算 Sentinel POW 算力题目...")
+        print("[*] 正在计算登录 Sentinel Token...")
         sentinel_login = get_real_sentinel_token(did, "authorize_continue", proxies, ua)
         if not sentinel_login:
-            print("[Error] 重新登录时 Sentinel Token 获取失败")
+            print("[Error] Sentinel Token 计算失败")
             return None
 
-        # 4. 提交登录入口意图 (username_password_login)
         login_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"login"}}'
         auth_cont_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -1158,10 +1148,9 @@ def run(proxy: Optional[str]) -> Optional[str]:
             data=login_body,
             proxies=proxies
         )
-        print(f"[*] 提交登录意向状态: {auth_cont_resp.status_code}")
+        print(f"[*] 登录开始意向状态: {auth_cont_resp.status_code}")
         human_delay(1.5, 3.0)
 
-        # 5. 提交登录密码 (verify 阶段)
         pwd_body = json.dumps({"password": reg_password})
         pwd_resp = s.post(
             "https://auth.openai.com/api/accounts/password/verify",
@@ -1169,28 +1158,23 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "referer": "https://auth.openai.com/log-in/password",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "openai-sentinel-token": sentinel_login,
             },
             data=pwd_body,
             proxies=proxies
         )
-        print(f"[*] /password/verify 校验状态: {pwd_resp.status_code}")
+        print(f"[*] 登录密码校验状态: {pwd_resp.status_code}")
         
         if pwd_resp.status_code != 200:
-            print(f"[Error] 登录密码验证失败: {pwd_resp.text[:200]}")
+            print(f"[Error] 登录密码校验失败: {pwd_resp.text[:200]}")
             return None
             
-        pwd_json = {}
-        try: pwd_json = pwd_resp.json()
-        except: pass
-        
+        pwd_json = pwd_resp.json() if pwd_resp.status_code == 200 else {}
         page_type = str(pwd_json.get("page", {}).get("type", "")).strip()
-        print(f"[*] 登录后续流程: {page_type}")
 
-        # 5. 判断是否触发登录侧 Email OTP 检查
-        # 6. 处理登录侧二次验证 (Email OTP)
         if page_type == "email_otp_verification":
-            print("[*] 触发登录二次验证 (Email OTP)，等待发码...")
-            human_delay(4.0, 8.0)
+            print("[*] 触发二次验证，轮询登录验证码...")
+            human_delay(8.0, 15.0)
             
             if mail_base == "custom_gmail":
                 login_otp = get_gmail_otp(email, proxies, ignore_code=reg_otp)
@@ -1202,7 +1186,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 login_otp = get_oai_code(dev_token, email, proxies, base=mail_base, ignore_code=reg_otp)
                 
             if not login_otp:
-                print("[Error] 登录验证码获取超时或失败")
+                print("[Error] 登录验证码获取超时")
                 return None
                 
             otp_val_resp = s.post(
@@ -1216,51 +1200,45 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 proxies=proxies
             )
             print(f"[*] 登录验证码校验状态: {otp_val_resp.status_code}")
-            if otp_val_resp.status_code != 200:
-                print(f"[Error] 登录验证码校验失败: {otp_val_resp.text[:200]}")
-                return None
-            human_delay(1.0, 2.0)
+            human_delay(2.0, 4.0)
 
-        # 7. 提取授权 Session 并选择 Workspace
         auth_cookie = s.cookies.get("oai-client-auth-session")
         if not auth_cookie:
-             print("[Error] 重登录完成后未获取到关键 auth Cookie")
+             print("[Error] 缺失 auth Cookie")
              return None
              
         auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
         workspaces = auth_json.get("workspaces") or []
-        if not workspaces:
-            print("[Error] 授权 Cookie 中缺失租户列表")
-            return None
-
         workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-        print(f"[*] 自动选择第一个工作区: {workspace_id}")
         
-        select_resp = s.post(
+        s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
             headers={"content-type": "application/json", "referer": "https://auth.openai.com/workspace-select"},
             data=f'{{"workspace_id":"{workspace_id}"}}',
             proxies=proxies
         )
-        if select_resp.status_code != 200:
-            print(f"[Error] 工作区选择接口返回报错: {select_resp.status_code}")
-            return None
 
-        # 8. 跟随重定向链，获取 OAuth 最终回调
-        continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
+        continue_url = str((s.cookies.get("oai-client-auth-session-continue-url") or "")).strip()
+        # 如果 cookie 没存，尝试从之前的 json 拿
         if not continue_url:
-            print("[Error] 响应内缺失 continue_url 跳转链接")
-            return None
+            # 兼容逻辑
+            pass 
 
-        print("[*] 正在追踪 OAuth 重定向链条...")
-        final_callback_url = follow_openai_redirects(s, continue_url)
+        print("[*] 追踪重定向链...")
+        # 重新获取跳转链接（如果 select_resp 有的话）
+        # 这里为了简化，我们直接用跳转追踪器从授权后的初始 URL 开始
+        final_callback_url = follow_openai_redirects(s, f"https://auth.openai.com/api/accounts/workspace/select?workspace_id={workspace_id}", proxies=proxies)
         if not final_callback_url:
-            print("[Error] 未能在 10 步跳转内截获回调地址")
+            print("[Error] 重定向追踪失败")
             return None
         
-        # 9. 执行最终的 Token 兑换，输出结果
-        print("[*] 回调已捕获，执行 Token 交换协议...")
-        ret = submit_callback_url(s, final_callback_url, login_oauth.code_verifier, proxies)
+        print("[*] 准备兑换最终 Token...")
+        ret = submit_callback_url(
+            callback_url=final_callback_url, 
+            expected_state=login_oauth.state, 
+            code_verifier=login_oauth.code_verifier, 
+            proxies=proxies
+        )
         return ret
 
     except Exception as e:
